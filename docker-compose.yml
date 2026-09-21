@@ -1,0 +1,189 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: ci-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # POSTGRES_USER is the provisioning superuser and is used ONLY by the init
+      # scripts. The application connects as DB_USER, which they create as
+      # NOSUPERUSER NOBYPASSRLS -- a superuser silently bypasses every row-level
+      # security policy, so OpCo isolation would stop being enforced with no error
+      # at query time.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-customer_intelligence}
+
+      # Consumed by the init scripts in docker/postgres/init.
+      DB_USER: ${DB_USER:-app}
+      DB_PASSWORD: ${DB_PASSWORD:-app}
+      CHECKPOINT_DB_NAME: ${CHECKPOINT_DB_NAME:-copilot_checkpoint}
+      CI_COPILOT_HOD_ROLE: ${CI_COPILOT_HOD_ROLE:-ci_copilot_hod}
+      CI_COPILOT_EXEC_ROLE: ${CI_COPILOT_EXEC_ROLE:-ci_copilot_exec}
+      CI_COPILOT_ROLE: ${CI_COPILOT_ROLE:-ci_copilot}
+      CI_LOADER_ROLE: ${CI_LOADER_ROLE:-ci_loader}
+      CI_ANALYST_ROLE: ${CI_ANALYST_ROLE:-ci_analyst}
+      # Optional: set to enable the read-only human login. Left empty,
+      # ci_analyst is created NOLOGIN and nobody can authenticate as it.
+      CI_ANALYST_PASSWORD: ${CI_ANALYST_PASSWORD:-}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ci_copilot_pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+      # bootstrap_roles.sql is mounted rather than copied so the container and the
+      # manual SETUP.md path use one source of truth and cannot drift.
+      - ./scripts:/opt/ci-scripts:ro
+    healthcheck:
+      # Wait for the APP role, not just the server: the init scripts create it
+      # after first start, and the migrate service connects as it.
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-app} -d ${DB_NAME:-customer_intelligence}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks:
+      - ci-net
+
+  agent-api-migrate:
+    build:
+      context: ./
+    container_name: ci-agent-api-migrate
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app
+      POSTGRES_URI: ${POSTGRES_URI:-postgresql://app:app@postgres:5432/customer_intelligence}
+      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
+
+      # CSV seeds consumed only by the loaders below (not by the serving app).
+      GLOSSARY_CSV_PATH: ${GLOSSARY_CSV_PATH:-/app/data/v3_column_glossary.csv}
+      METRIC_CSV_PATH: ${METRIC_CSV_PATH:-/app/data/v3_metric_definition_seed.csv}
+      STORE_CSV_PATH: ${STORE_CSV_PATH:-/app/data/store_name.csv}
+      PRODUCT_CATALOG_CSV_PATH: ${PRODUCT_CATALOG_CSV_PATH:-/app/data/product_catalog.csv}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Apply migrations, then seed the governed tables from the CSV seeds so the app
+    # never starts on empty metadata. Order matters: reference data first, because
+    # the glossary and metric registry describe the objects it creates.
+    command:
+      - sh
+      - -c
+      - >
+        alembic upgrade head &&
+        python -m app.scripts.load_reference_data &&
+        python -m app.scripts.load_glossary &&
+        python -m app.scripts.load_metric_definitions
+    networks:
+      - ci-net
+
+  agent-api:
+    build:
+      context: ./
+    container_name: ci-agent-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_URI: ${POSTGRES_URI:-postgresql://app:app@postgres:5432/customer_intelligence}
+      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
+
+      CHECKPOINT_DB_NAME: ${CHECKPOINT_DB_NAME:-copilot_checkpoint}
+      CHECKPOINT_POSTGRES_URI: ${CHECKPOINT_POSTGRES_URI:-postgresql://app:app@postgres:5432/copilot_checkpoint}
+      CHECKPOINT_SETUP_ON_STARTUP: ${CHECKPOINT_SETUP_ON_STARTUP:-true}
+      LANGGRAPH_CHECKPOINT_ENABLED: ${LANGGRAPH_CHECKPOINT_ENABLED:-true}
+      CHECKPOINT_POOL_MAX_SIZE: ${CHECKPOINT_POOL_MAX_SIZE:-10}
+
+      # LLM provider switch
+      LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.0}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-120}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
+
+      # Gemini / Vertex AI
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-asia-southeast1}
+      GOOGLE_GENAI_USE_VERTEXAI: ${GOOGLE_GENAI_USE_VERTEXAI:-true}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      GOOGLE_APPLICATION_CREDENTIALS: /root/.config/gcloud/application_default_credentials.json
+
+      # OpenAI
+      # OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4-mini}
+
+      GLOSSARY_SOURCE: ${GLOSSARY_SOURCE:-postgres}
+
+      CI_ACCESS_LOG_ENABLED: ${CI_ACCESS_LOG_ENABLED:-true}
+
+      LOOKUP_SUGGEST_SCORE: ${LOOKUP_SUGGEST_SCORE:-62}
+      LOOKUP_CONFIDENT_SCORE: ${LOOKUP_CONFIDENT_SCORE:-88}
+      LOOKUP_AMBIGUITY_MARGIN: ${LOOKUP_AMBIGUITY_MARGIN:-4}
+      LOOKUP_OPTION_WINDOW: ${LOOKUP_OPTION_WINDOW:-10}
+      LOOKUP_MAX_OPTIONS: ${LOOKUP_MAX_OPTIONS:-10}
+
+      MAX_QUERY_ROWS: ${MAX_QUERY_ROWS:-500}
+      CHAT_HISTORY_LIMIT: ${CHAT_HISTORY_LIMIT:-12}
+      MAX_RESULT_PREVIEW_ROWS: ${MAX_RESULT_PREVIEW_ROWS:-100}
+      STREAM_CHUNK_SIZE: ${STREAM_CHUNK_SIZE:-120}
+      MAX_SQL_RETRIES: ${MAX_SQL_RETRIES:-2}
+      API_TIMEOUT_SECONDS: ${API_TIMEOUT_SECONDS:-180}
+      SQL_TIMEOUT_SECONDS: ${SQL_TIMEOUT_SECONDS:-60}
+
+      # MLflow / OpenTelemetry observability
+      MLFLOW_TRACKING_ENABLED: ${MLFLOW_TRACKING_ENABLED:-true}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-}
+      MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-customer-intelligence-copilot}
+      MLFLOW_TRACKING_USERNAME: ${MLFLOW_TRACKING_USERNAME:-}
+      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_TRACKING_PASSWORD:-}
+      MLFLOW_GEMINI_AUTOLOG_ENABLED: ${MLFLOW_GEMINI_AUTOLOG_ENABLED:-true}
+      # OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}
+      # OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: ${OTEL_EXPORTER_OTLP_TRACES_PROTOCOL:-grpc}
+      # OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-customer-intelligence-copilot}
+      # MLFLOW_TRACE_ENABLE_OTLP_DUAL_EXPORT: ${MLFLOW_TRACE_ENABLE_OTLP_DUAL_EXPORT:-false}
+      # MLFLOW_ENABLE_OTEL_GENAI_SEMCONV: ${MLFLOW_ENABLE_OTEL_GENAI_SEMCONV:-true}
+    volumes:
+      - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      agent-api-migrate:
+        condition: service_completed_successfully
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+    networks:
+      - ci-net
+
+  # Optional dev seeder: docker compose --profile seed run --rm mock-data
+  mock-data:
+    build:
+      context: ./
+    container_name: ci-mock-data
+    profiles: ["seed"]
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app
+      POSTGRES_URI: ${POSTGRES_URI:-postgresql://app:app@postgres:5432/customer_intelligence}
+    depends_on:
+      agent-api-migrate:
+        condition: service_completed_successfully
+    command:
+      - python
+      - scripts/generate_mock_data.py
+      - "--months"
+      - "${MOCK_MONTHS:-6}"
+      - "--customers"
+      - "${MOCK_CUSTOMERS:-2000}"
+    networks:
+      - ci-net
+
+volumes:
+  ci_copilot_pgdata:
+
+networks:
+  ci-net:
+    driver: bridge
